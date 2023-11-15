@@ -55,7 +55,7 @@ ifeq "$(origin CC)" "default"
 endif
 
 ifndef AFL_TRACE_PC
-  PROGS      = ../afl-clang-fast ../afl-llvm-pass.so ../afl-llvm-rt.o ../afl-llvm-rt-32.o ../afl-llvm-rt-64.o
+  PROGS      = ../afl-clang-fast ../afl-llvm-pass.so ../afl-llvm-rt.o ../afl-llvm-rt-32.o ../afl-llvm-rt-64.o ../llvm_coverage_san_inline_pass.so
 else
   PROGS      = ../afl-clang-fast ../afl-llvm-rt.o ../afl-llvm-rt-32.o ../afl-llvm-rt-64.o
 endif
@@ -80,6 +80,9 @@ endif
 	ln -sf afl-clang-fast ../afl-clang-fast++
 
 ../afl-llvm-pass.so: afl-llvm-pass.so.cc | test_deps
+	$(CXX) $(CLANG_CFL) -shared $< -o $@ $(CLANG_LFL)
+
+../llvm_coverage_san_inline_pass.so: llvm_coverage_san_inline.so.cc | test_deps
 	$(CXX) $(CLANG_CFL) -shared $< -o $@ $(CLANG_LFL)
 
 ../afl-llvm-rt.o: afl-llvm-rt.o.c | test_deps

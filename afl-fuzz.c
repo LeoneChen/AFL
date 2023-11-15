@@ -55,6 +55,9 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/file.h>
+#include <math.h>
+#include <float.h>
+#include <limits.h>
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
 #  include <sys/sysctl.h>
@@ -102,7 +105,6 @@ EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
            force_deterministic,       /* Force deterministic stages?      */
            use_splicing,              /* Recombine input files?           */
            dumb_mode,                 /* Run in non-instrumented mode?    */
-           score_changed,             /* Scoring for favorites changed?   */
            kill_signal,               /* Signal that killed the child     */
            resuming_fuzz,             /* Resuming an older fuzzing job?   */
            timeout_given,             /* Specific timeout given?          */
@@ -142,12 +144,41 @@ EXP_ST u8  virgin_bits[MAP_SIZE],     /* Regions yet untouched by fuzzing */
 
 static u8  var_bytes[MAP_SIZE];       /* Bytes that appear to be variable */
 
+static u8 math_cache_computed_before = 0; /* set 1 after the first time compuation of math cache */
 static s32 shm_id;                    /* ID of the SHM region             */
+static u64 hit_bits[MAP_SIZE];        /* Hits to every basic block transition */ 
+static double katz_weight[MAP_SIZE];  /* Katz centrality for every node */ 
+static double scale_factor;           /* scale factor for edge weight */ 
+
+static u32 last_cnt_free_cksum = 0;      /* last edge cnt */
+
+static u32 num_border_edge;           /* total number of all possible border edges */
+static u32 num_edge;                  /* total number of all edges */
+static double border_edge_weight[2*MAP_SIZE];  /* weight(centrality / sqrt(freq)) for every border edge, total num is number of all possible border edges */
+static u32 border_edge_parent[2*MAP_SIZE];  /*  parent side for every border edge */
+static u32 border_edge_child[2*MAP_SIZE];  /* child side for every border edge */
+static u32 cnt_free_cksum_cache[MAP_SIZE];  /* cache for all seeds' cnt_free bitmap checksum  */
+static u32 cnt_free_cksum_cnt;
+static u8 schedule_explor = 0;         /* exploration mode scheduling */
+
+static u32 local_border_edge_id[MAP_SIZE>>3];  /* local border edge id table */
+
+static double nonzero_border_edge_weight[MAP_SIZE>>2];  /* tmp array for stroing nonzero border edge weight, only for sorting */
+
+typedef struct vector {
+    int *children;
+    int total;
+} child_list;
+
+u32 pass_rate = 5;
+u32 adjust_rate = 1;
+static child_list* node_child_list[MAP_SIZE];  /* children list for every node */
 
 static volatile u8 stop_soon,         /* Ctrl-C pressed?                  */
                    clear_screen = 1,  /* Window resized?                  */
                    child_timed_out;   /* Traced process timed out?        */
 
+static double border_edge_weight_threshold = 0.0; /* threshold for borderedge*/
 EXP_ST u32 queued_paths,              /* Total number of queued testcases */
            queued_variable,           /* Testcases with variable behavior */
            queued_at_start,           /* Total number of initial inputs   */
@@ -176,6 +207,8 @@ EXP_ST u64 total_crashes,             /* Total number of crashes          */
            last_crash_time,           /* Time for most recent crash (ms)  */
            last_hang_time,            /* Time for most recent hang (ms)   */
            last_crash_execs,          /* Exec counter at last crash       */
+           last_math_cache_time,            /* Time for most recent math cache computation (s)   */
+           last_edge_log_time,            /* Time for most recent log edge coverage computation (s)   */
            queue_cycle,               /* Queue round counter              */
            cycles_wo_finds,           /* Cycles without any new paths     */
            trim_execs,                /* Execs done to trim input files   */
@@ -210,6 +243,10 @@ static u32 rand_cnt;                  /* Random number counter            */
 static u64 total_cal_us,              /* Total calibration time (us)      */
            total_cal_cycles;          /* Total calibration cycles         */
 
+static u64 total_cal_us_fast,              /* Total calibration time (us) for normal inputs(exclude any slow inputs)     */
+           total_cal_cycles_fast,          /* Total calibration cycles for normal inputs(exclude any slow inputs)        */
+            avg_us_fast;            
+
 static u64 total_bitmap_size,         /* Total bit count for all bitmaps  */
            total_bitmap_entries;      /* Number of bitmaps counted        */
 
@@ -223,6 +260,12 @@ static s32 cpu_aff = -1;       	      /* Selected CPU core                */
 
 static FILE* plot_file;               /* Gnuplot output file              */
 
+static FILE* edge_weight_file;        /* log each border edge weight      */
+
+static FILE* sched_log_file;         /* schedule log file                 */
+
+static FILE* edge_log_file;         /* edge log file                 */
+
 struct queue_entry {
 
   u8* fname;                          /* File name for the test case      */
@@ -231,13 +274,16 @@ struct queue_entry {
   u8  cal_failed,                     /* Calibration failed?              */
       trim_done,                      /* Trimmed?                         */
       was_fuzzed,                     /* Had any fuzzing done yet?        */
+      was_fuzzed2,                     /* Had any fuzzing done yet?        */
       passed_det,                     /* Deterministic stages passed?     */
       has_new_cov,                    /* Triggers new coverage?           */
       var_behavior,                   /* Variable behavior?               */
       favored,                        /* Currently favored?               */
+      cnt_free_cksum_dup,
       fs_redundant;                   /* Marked as redundant in the fs?   */
-
+  u32 qid;                             /* queue id for current item        */  
   u32 bitmap_size,                    /* Number of bits set in bitmap     */
+      cnt_free_cksum,                     /* Checksum of the execution trace  */
       exec_cksum;                     /* Checksum of the execution trace  */
 
   u64 exec_us,                        /* Execution time (us)              */
@@ -247,18 +293,27 @@ struct queue_entry {
   u8* trace_mini;                     /* Trace bytes, if kept             */
   u32 tc_ref;                         /* Trace bytes ref count            */
 
+  u32* border_edge;                   /* list of border_edge IDX */
+  u32 border_edge_cnt;                /* total number of local border_edge*/
   struct queue_entry *next,           /* Next element, if any             */
                      *next_100;       /* 100 elements ahead               */
 
 };
 
+typedef struct{
+    double energy;
+    struct queue_entry * seed;
+}my_union;
+
+static my_union ptr_energy[MAP_SIZE]; 
+static double energy_arr[MAP_SIZE]; 
+
 static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
                           *queue_cur, /* Current offset within the queue  */
+                          *queue_cur_expor, /* Current offset of seed in exploration mode  */
                           *queue_top, /* Top of the list                  */
                           *q_prev100; /* Previous 100 marker              */
 
-static struct queue_entry*
-  top_rated[MAP_SIZE];                /* Top entries for bitmap bytes     */
 
 struct extra_data {
   u8* data;                           /* Dictionary token data            */
@@ -739,37 +794,6 @@ static void mark_as_variable(struct queue_entry* q) {
 }
 
 
-/* Mark / unmark as redundant (edge-only). This is not used for restoring state,
-   but may be useful for post-processing datasets. */
-
-static void mark_as_redundant(struct queue_entry* q, u8 state) {
-
-  u8* fn;
-  s32 fd;
-
-  if (state == q->fs_redundant) return;
-
-  q->fs_redundant = state;
-
-  fn = strrchr(q->fname, '/');
-  fn = alloc_printf("%s/queue/.state/redundant_edges/%s", out_dir, fn + 1);
-
-  if (state) {
-
-    fd = open(fn, O_WRONLY | O_CREAT | O_EXCL, 0600);
-    if (fd < 0) PFATAL("Unable to create '%s'", fn);
-    close(fd);
-
-  } else {
-
-    if (unlink(fn)) PFATAL("Unable to remove '%s'", fn);
-
-  }
-
-  ck_free(fn);
-
-}
-
 
 /* Append new test case to the queue. */
 
@@ -781,6 +805,7 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   q->len          = len;
   q->depth        = cur_depth + 1;
   q->passed_det   = passed_det;
+  q->qid          = queued_paths;
 
   if (q->depth > max_depth) max_depth = q->depth;
 
@@ -818,6 +843,7 @@ EXP_ST void destroy_queue(void) {
 
     n = q->next;
     ck_free(q->fname);
+    ck_free(q->border_edge);
     ck_free(q->trace_mini);
     ck_free(q);
     q = n;
@@ -882,14 +908,14 @@ static inline u8 has_new_bits(u8* virgin_map) {
   u64* current = (u64*)trace_bits;
   u64* virgin  = (u64*)virgin_map;
 
-  u32  i = (MAP_SIZE >> 3);
+  u32  i = ((num_edge >> 3) + 2);
 
 #else
 
   u32* current = (u32*)trace_bits;
   u32* virgin  = (u32*)virgin_map;
 
-  u32  i = (MAP_SIZE >> 2);
+  u32  i = ((num_edge >> 2) + 2);
 
 #endif /* ^__x86_64__ */
 
@@ -951,7 +977,7 @@ static inline u8 has_new_bits(u8* virgin_map) {
 static u32 count_bits(u8* mem) {
 
   u32* ptr = (u32*)mem;
-  u32  i   = (MAP_SIZE >> 2);
+  u32  i   = ((num_edge >> 2) + 2);
   u32  ret = 0;
 
   while (i--) {
@@ -986,7 +1012,7 @@ static u32 count_bits(u8* mem) {
 static u32 count_bytes(u8* mem) {
 
   u32* ptr = (u32*)mem;
-  u32  i   = (MAP_SIZE >> 2);
+  u32  i   = ((num_edge >> 2)+2);
   u32  ret = 0;
 
   while (i--) {
@@ -1012,7 +1038,7 @@ static u32 count_bytes(u8* mem) {
 static u32 count_non_255_bytes(u8* mem) {
 
   u32* ptr = (u32*)mem;
-  u32  i   = (MAP_SIZE >> 2);
+  u32  i   = ((num_edge >> 2)+2);
   u32  ret = 0;
 
   while (i--) {
@@ -1051,7 +1077,7 @@ static const u8 simplify_lookup[256] = {
 
 static void simplify_trace(u64* mem) {
 
-  u32 i = MAP_SIZE >> 3;
+  u32  i   = ((num_edge >> 3)+2);
 
   while (i--) {
 
@@ -1082,7 +1108,7 @@ static void simplify_trace(u64* mem) {
 
 static void simplify_trace(u32* mem) {
 
-  u32 i = MAP_SIZE >> 2;
+  u32  i   = ((num_edge >> 2)+2);
 
   while (i--) {
 
@@ -1145,7 +1171,7 @@ EXP_ST void init_count_class16(void) {
 
 static inline void classify_counts(u64* mem) {
 
-  u32 i = MAP_SIZE >> 3;
+  u32  i   = ((num_edge >> 3)+2);
 
   while (i--) {
 
@@ -1172,7 +1198,7 @@ static inline void classify_counts(u64* mem) {
 
 static inline void classify_counts(u32* mem) {
 
-  u32 i = MAP_SIZE >> 2;
+  u32  i   = ((num_edge >> 2)+2);
 
   while (i--) {
 
@@ -1205,135 +1231,371 @@ static void remove_shm(void) {
 }
 
 
-/* Compact trace bytes into a smaller bitmap. We effectively just drop the
-   count information here. This is called only sporadically, for some
-   new paths. */
 
-static void minimize_bits(u8* dst, u8* src) {
-
-  u32 i = 0;
-
-  while (i < MAP_SIZE) {
-
-    if (*(src++)) dst[i >> 3] |= 1 << (i & 7);
-    i++;
-
+static inline int search_border_edge_id(int parent, int child){
+  int l = 0;
+  int h = num_border_edge - 1 ;
+  int mid;
+  int first_idx = 0;
+  int last_idx = num_border_edge - 1;
+  // binary search to find the first matching idx of parent node
+  while (l <= h){
+    mid = (int)((l+h)/2);
+    if (border_edge_parent[mid] > parent){
+      h = mid - 1;
+      last_idx = mid;
+    }
+    else if (border_edge_parent[mid] < parent)
+      l = mid + 1;
+    else{
+      first_idx = mid;
+      h = mid - 1;
+    }
   }
+  
+  // binary search to find the last matching idx of parent node
+  l = first_idx;
+  h = last_idx;
+  while (l <= h){
+    mid = (int)((l+h)/2);
+    if (border_edge_parent[mid] > parent)
+      h = mid - 1;
+    else{
+      last_idx = mid;
+      l = mid + 1;
+    }
+  }
+  
+  // bin search to find the matching idx for child node from range(first_idx, last_idx)
+  l = first_idx;
+  h = last_idx;
+  while (l <= h){
+    mid = (int)((l+h)/2);
+    if (border_edge_child[mid] > child)
+      h = mid - 1;
+    else if (border_edge_child[mid] < child)
+      l = mid + 1;
+    else
+      return mid;
+  }
+  return -1;
 
 }
 
-
-/* When we bump into a new path, we call this to see if the path appears
-   more "favorable" than any of the existing ones. The purpose of the
-   "favorables" is to have a minimal set of paths that trigger all the bits
-   seen in the bitmap so far, and focus on fuzzing them at the expense of
-   the rest.
-
-   The first step of the process is to maintain a list of top_rated[] entries
-   for every byte in the bitmap. We win that slot if there is no previous
-   contender, or if the contender has a more favorable speed x size factor. */
-
+// identify a seed's border edges
 static void update_bitmap_score(struct queue_entry* q) {
-
+  
   u32 i;
-  u64 fav_factor = q->exec_us * q->len;
+  u32 local_border_edge_cnt = 0;
+ 
+  static int dbg_func_hit_cnt = 0;
+  dbg_func_hit_cnt += 1;
 
-  /* For every byte set in trace_bits[], see if there is a previous winner,
-     and how it compares to us. */
+  /* free child_list if not null */
+  if (q->border_edge)
+    ck_free(q->border_edge);
 
-  for (i = 0; i < MAP_SIZE; i++)
+  memset(local_border_edge_id, 0, (MAP_SIZE>>3)*sizeof(u32));
 
-    if (trace_bits[i]) {
-
-       if (top_rated[i]) {
-
-         /* Faster-executing or smaller test cases are favored. */
-
-         if (fav_factor > top_rated[i]->exec_us * top_rated[i]->len) continue;
-
-         /* Looks like we're going to win. Decrease ref count for the
-            previous winner, discard its trace_bits[] if necessary. */
-
-         if (!--top_rated[i]->tc_ref) {
-           ck_free(top_rated[i]->trace_mini);
-           top_rated[i]->trace_mini = 0;
-         }
-
-       }
-
-       /* Insert ourselves as the new winner. */
-
-       top_rated[i] = q;
-       q->tc_ref++;
-
-       if (!q->trace_mini) {
-         q->trace_mini = ck_alloc(MAP_SIZE >> 3);
-         minimize_bits(q->trace_mini, trace_bits);
-       }
-
-       score_changed = 1;
-
-     }
-
-}
-
-
-/* The second part of the mechanism discussed above is a routine that
-   goes over top_rated[] entries, and then sequentially grabs winners for
-   previously-unseen bytes (temp_v) and marks them as favored, at least
-   until the next run. The favored entries are given more air time during
-   all fuzzing steps. */
-
-static void cull_queue(void) {
-
-  struct queue_entry* q;
-  static u8 temp_v[MAP_SIZE >> 3];
-  u32 i;
-
-  if (dumb_mode || !score_changed) return;
-
-  score_changed = 0;
-
-  memset(temp_v, 255, MAP_SIZE >> 3);
-
-  queued_favored  = 0;
-  pending_favored = 0;
-
-  q = queue;
-
-  while (q) {
-    q->favored = 0;
-    q = q->next;
-  }
-
-  /* Let's see if anything in the bitmap isn't captured in temp_v.
-     If yes, and if it has a top_rated[] contender, let's use it. */
-
-  for (i = 0; i < MAP_SIZE; i++)
-    if (top_rated[i] && (temp_v[i >> 3] & (1 << (i & 7)))) {
-
-      u32 j = MAP_SIZE >> 3;
-
-      /* Remove all bits belonging to the current entry from temp_v. */
-
-      while (j--) 
-        if (top_rated[i]->trace_mini[j])
-          temp_v[j] &= ~top_rated[i]->trace_mini[j];
-
-      top_rated[i]->favored = 1;
-      queued_favored++;
-
-      if (!top_rated[i]->was_fuzzed) pending_favored++;
-
+  for (i = 0; i < (num_edge+2); i++)
+    if (trace_bits[i] && node_child_list[i]) {
+      // skip non-branching node
+      if (node_child_list[i]->total < 2) continue;
+      // loop all children node of the triggerd parent node
+      for(int j=0; j< node_child_list[i]->total; j++){
+        // children node not triggered before, find an border edge (i, child_node), then search its corresponding borderedge ID
+        int child_node = node_child_list[i]->children[j];
+        if(virgin_bits[child_node] == 0xff){
+          local_border_edge_id[local_border_edge_cnt] = search_border_edge_id(i, child_node);
+          if (local_border_edge_id[local_border_edge_cnt] == -1){
+            printf("search_border_edge_id error\n");
+            exit(0);
+          }
+          local_border_edge_cnt+=1;
+        }
+      }
     }
 
+  q->border_edge_cnt = local_border_edge_cnt;
+  q->border_edge = (u32 *) ck_alloc(local_border_edge_cnt * sizeof(int));
+  for (i=0; i < local_border_edge_cnt; i++){
+    q->border_edge[i] = local_border_edge_id[i];
+  }
+  
+}
+
+// compare function for double 
+int my_cmp(const void *v1, const void *v2) {
+  double f1=*((double*)v1);
+  double f2=*((double*)v2);
+  if(isless(f1, f2)) return -1;
+  else if(isgreater(f1, f2)) return 1;
+  return 0;
+}
+
+// pre-compute weight for each border edge and cache the result into a table
+void compute_math_cache(void){
+  double sum = 0.0;
+  int cnt = 0;
+   
+  memset(nonzero_border_edge_weight, 0, (MAP_SIZE>>2)*sizeof(double));  
+   
+  //clean all old log  
+  ftruncate(fileno(edge_weight_file), 0);
+
+  for (int i = 0; i < num_border_edge; i++){
+    
+    int parent = border_edge_parent[i];
+    if (hit_bits[parent] == 0){ 
+      border_edge_weight[i] = 0.0;
+      continue;
+    }
+    // parent node not hit, skip
+    if (virgin_bits[parent] == 0xff){
+      border_edge_weight[i] = 0.0; 
+      continue;
+    }
+    //child node hit already hit, skip 
+    int child = border_edge_child[i];
+    if (virgin_bits[child] != 0xff){
+      border_edge_weight[i] = 0.0;
+      continue;
+    }
+
+    if(fpclassify(katz_weight[child]) == FP_ZERO){
+      border_edge_weight[i] = 0.0;
+      continue;
+    }
+    
+    double tmp_edge_weight = katz_weight[child] / sqrt(hit_bits[parent]);
+    border_edge_weight[i] = tmp_edge_weight; 
+    nonzero_border_edge_weight[cnt] = tmp_edge_weight;
+    cnt += 1;
+    sum += tmp_edge_weight;
+
+    fprintf(edge_weight_file, "border edge weight(1000X) %d, %f, %f, %f\n", i , tmp_edge_weight * 1000, katz_weight[child], sqrt(hit_bits[parent]));
+    fflush(edge_weight_file);
+  }
+  
+  scale_factor = 1/(sum/cnt)/adjust_rate;
+  
+  //Only consider top 50% or at most top 512 border edges into weight computation.
+  qsort(nonzero_border_edge_weight, cnt, sizeof(double), my_cmp);
+  
+  int thres_idx = cnt * pass_rate/10;
+  if (cnt-thres_idx > 512) thres_idx = cnt-512;
+
+  border_edge_weight_threshold = nonzero_border_edge_weight[thres_idx];
+  return;
+}
+
+// reload katz centrality 
+void reload_centrality_file(){
+  
+  FILE * fp;
+  char *line = NULL;
+  size_t len = 0;
+  ssize_t read;
+  char buf[4];
+  // if file not exit, just return
+  if( access( "dyn_katz_cent", F_OK ) != 0 )
+    return;
+
+  memset(buf, 0, 4);
+
+  fp = fopen("dyn_katz_cent", "r");
+  if(fp == NULL){
+    perror("dyn_border_edges open failed \n");
+    exit(0);
+  }
+  
+  while((read = getline(&line, &len, fp)) != -1){
+    char* idx_ptr = strtok(line, " ");    
+    int idx = atoi(idx_ptr);
+    char* cent_ptr = strtok(NULL, " ");
+    char* end_ptr;
+    double ret = strtod(cent_ptr, &end_ptr);
+    katz_weight[idx] = ret; 
+  }
+  free(line);
+  fclose(fp);
+  return; 
+}
+
+// identify border edge and compute energy
+static inline double check_border_edge(struct queue_entry* q) {
+
+  double total_energy = 0.0;
+  for (int i = 0; i < q->border_edge_cnt; i++){
+    int border_edge_idx = q->border_edge[i];
+    int child = border_edge_child[border_edge_idx];
+    // check border edge is still not triggered
+    if (virgin_bits[child] == 0xff){
+      double tmp_edge_weight =  border_edge_weight[border_edge_idx];
+      // add nonzero border edge weight
+      if (fpclassify(tmp_edge_weight) != FP_ZERO){
+        total_energy += tmp_edge_weight;
+      }
+      // check if zero borde edge weight is new, or just zero weight
+      else{
+        int parent = border_edge_parent[border_edge_idx];
+        // new border edge
+        if ((fpclassify(katz_weight[child]) != FP_ZERO) && (virgin_bits[child] == 0xff) && (hit_bits[parent] > 0)){
+          
+          tmp_edge_weight = katz_weight[child] / sqrt(hit_bits[parent]); 
+          border_edge_weight[border_edge_idx] = tmp_edge_weight;
+          
+          total_energy += tmp_edge_weight;
+        }
+      }
+    }
+  }
+  return total_energy;
+
+}
+
+// compare function for energy data type
+int energy_cmp(const void *p1, const void *p2)
+{
+    const my_union *e1 = p1;
+    const my_union *e2 = p2;
+
+    if (isless(e1->energy, e2->energy)) return 1;
+    if (isgreater(e1->energy, e2->energy)) return -1;
+    return 0;
+}
+
+// select seed from seed queue 
+static void cull_queue(void) {
+
+  struct queue_entry* q; 
+  
+  if(!math_cache_computed_before){
+    compute_math_cache();
+    
+    last_math_cache_time = get_cur_time()/1000;
+    math_cache_computed_before = 1;
+  }
+  // recompute the math cache every 2 minutes 
+  else if (get_cur_time()/1000 - last_math_cache_time > 120){ 
+    compute_math_cache();
+    last_math_cache_time = get_cur_time()/1000;
+  }
+  
+  // clear ptr_energy array
+  memset(ptr_energy, 0, MAP_SIZE*sizeof(my_union));
+  memset(energy_arr, 0, MAP_SIZE*sizeof(double));
+  // check if there is a not_fuzzed seed
+  int found_not_fuzzed_seed = 0; 
+  int found_not_fuzzed2_seed = 0; 
+  // arrary cnt
+  int arr_cnt = 0;
+  
+
   q = queue;
 
   while (q) {
-    mark_as_redundant(q, !q->favored);
+    // check if there is a not fuzzed seed, determine go greedy or weighted random selection  
+    if(!q->was_fuzzed)
+        found_not_fuzzed_seed = 1;
+    if(!q->was_fuzzed2)
+        found_not_fuzzed2_seed = 1;
+    double energy = check_border_edge(q);
+    ptr_energy[arr_cnt].energy = energy;
+    ptr_energy[arr_cnt].seed = q;
+
     q = q->next;
+    arr_cnt += 1;
+  }
+  
+  // sort ptr_energy using energy in decreasing order
+  qsort(ptr_energy, arr_cnt, sizeof(my_union), energy_cmp);
+
+  if(found_not_fuzzed_seed == 1){
+    // greedly select the not_fuzzed seed with largest energy
+    for (int idx=0; idx<arr_cnt; idx++){
+      if (!((ptr_energy[idx].seed)->was_fuzzed)){
+        queue_cur = ptr_energy[idx].seed;
+        break; 
+      }
+    }
+  }
+  else{
+    // if all seeds are fuzzed (selected with equal times), then reset was_fuzzed for all seeds.
+    if (found_not_fuzzed2_seed == 0){
+      q = queue;
+      while (q) {
+        q->was_fuzzed2 = 0;
+        q = q->next;
+      }
+    }
+
+
+    // greedly select the not_fuzzed seed with largest energy
+    for (int idx=0; idx<arr_cnt; idx++){
+      if (!((ptr_energy[idx].seed)->was_fuzzed2)){
+        queue_cur = ptr_energy[idx].seed;
+        (ptr_energy[idx].seed)->was_fuzzed2 = 1;
+        break; 
+      }
+    }
+  }
+  
+  if (get_cur_time()/1000 - last_edge_log_time > 300){
+    
+    
+    // read signal, if "0" return, if "1" reload centrality file 
+    if( access( "signal", F_OK ) == 0 ){
+      
+      FILE *fp = fopen("signal", "w");
+      if(fp == NULL){
+        perror("signal open failed \n");
+        exit(0);
+      }
+      char *buf = "1\n";
+      fwrite(buf, 2, 1, fp);
+      fclose(fp);
+      reload_centrality_file();
+    }
+    
+    FILE *fp = fopen("cur_coverage", "w");
+    if(fp == NULL){
+      perror("signal open failed \n");
+      exit(0);
+    }
+    
+    char file_buffer[4096 + 64]; 
+    int buffer_count = 0 ;
+    for (int i = 0; i < (num_edge + 2); i++){
+      if (unlikely(virgin_bits[i] != 0xff)){
+        buffer_count += sprintf(&file_buffer[buffer_count], "%d ", i);
+        if (buffer_count >= 4096){
+          fwrite(file_buffer, buffer_count, 1, fp);
+          buffer_count = 0;
+        }
+      }
+    }
+    if(buffer_count > 0)
+      fwrite( file_buffer, buffer_count, 1, fp);
+    fclose(fp);
+    
+    fprintf(edge_log_file, "edge cov %d ", count_non_255_bytes(virgin_bits)); 
+    time_t now;
+    struct tm *tm;
+    now = time(0);
+    if((tm = localtime (&now)) == NULL) {
+        printf("Error extracting time stuff\n");
+    }
+    else{
+        fprintf(edge_log_file, "%04d-%02d-%02d %02d:%02d:%02d\n",
+            tm->tm_year+1900, tm->tm_mon+1, tm->tm_mday,
+            tm->tm_hour, tm->tm_min, tm->tm_sec);
+    } 
+    fflush(edge_log_file);  
+    last_edge_log_time = get_cur_time()/1000;
   }
 
+  return;
 }
 
 
@@ -1945,6 +2207,69 @@ static void load_auto(void) {
 
 }
 
+#ifdef __x86_64__
+/* increment hit bits by 1 for every element of trace_bits that has been hit.
+ effectively counts that one input has hit each element of trace_bits */
+static inline void increment_hit_bits(){
+  /*
+  for (int i = 0; i < (num_edge+2); i++){
+    if (unlikely(trace_bits[i]) && (hit_bits[i] < ULONG_MAX))
+      hit_bits[i]++;
+  }
+  */
+  u32 total_iters = ((num_edge + 2 + 7 ) >> 3);
+  u64 *current = (u64 *)trace_bits;
+  for (u32 i = 0; i < total_iters; ++i){ 
+    if (unlikely(*current)){
+      u8 *cur = (u8 *)current;
+      u32 base_idx = i * 8 ;
+      if (cur[0])
+        hit_bits[base_idx]++;
+      if (cur[1])
+        hit_bits[base_idx+1]++;
+      if (cur[2])
+        hit_bits[base_idx+2]++;
+      if (cur[3])
+        hit_bits[base_idx+3]++;
+      if (cur[4])
+        hit_bits[base_idx+4]++;
+      if (cur[5])
+        hit_bits[base_idx+5]++;
+      if (cur[6])
+        hit_bits[base_idx+6]++;
+      if (cur[7])
+        hit_bits[base_idx+7]++;
+    }
+    current++;
+  }
+}
+#else
+static inline void increment_hit_bits(){
+  /*
+  for (int i = 0; i < (num_edge+2); i++){
+    if (unlikely(trace_bits[i]) && (hit_bits[i] < ULONG_MAX))
+      hit_bits[i]++;
+  }
+  */
+  u32 total_iters = ((num_edge + 2 + 3 ) >> 2);
+  u32 *current = (u32 *)trace_bits;
+  for (u32 i = 0; i < total_iters; ++i){ 
+    if (unlikely(*current)){
+      u8 *cur = (u8 *)current;
+      u32 base_idx = i * 8 ;
+      if (cur[0])
+        hit_bits[base_idx]++;
+      if (cur[1])
+        hit_bits[base_idx+1]++;
+      if (cur[2])
+        hit_bits[base_idx+2]++;
+      if (cur[3])
+        hit_bits[base_idx+3]++;
+    }
+    current++;
+  }
+}
+#endif /* ^__x86_64__ */
 
 /* Destroy extras. */
 
@@ -2532,6 +2857,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
                          u32 handicap, u8 from_queue) {
 
   static u8 first_trace[MAP_SIZE];
+  static u8 cnt_free_trace[MAP_SIZE];
 
   u8  fault = 0, new_bits = 0, var_detected = 0,
       first_run = (q->exec_cksum == 0);
@@ -2561,6 +2887,30 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   if (dumb_mode != 1 && !no_forkserver && !forksrv_pid)
     init_forkserver(argv);
 
+  if (q->cnt_free_cksum == 0){
+    memcpy(cnt_free_trace, trace_bits, MAP_SIZE);
+    simplify_trace((u64*)cnt_free_trace); 
+    q->cnt_free_cksum = hash32(cnt_free_trace, MAP_SIZE, HASH_CONST);
+    
+    /* check current seed's bitmap hash is dupliacted or not. */
+    u32 cur_cnt_free_cksum = q->cnt_free_cksum;
+    u8 found_dup = 0;
+    for (int cksum_idx = 0; cksum_idx < cnt_free_cksum_cnt; cksum_idx++) {
+      if(cur_cnt_free_cksum == cnt_free_cksum_cache[cksum_idx]){
+        /* mark duplicated cksum, skip this seed later */
+        q->cnt_free_cksum_dup = 1;
+        found_dup = 1;
+        break;
+      }
+    }
+    /* save unique cksum */
+    if (!found_dup){
+      cnt_free_cksum_cache[cnt_free_cksum_cnt] = cur_cnt_free_cksum;
+      cnt_free_cksum_cnt += 1;
+      q->cnt_free_cksum_dup = 0;
+    }
+
+  }
   if (q->exec_cksum) memcpy(first_trace, trace_bits, MAP_SIZE);
 
   start_us = get_cur_time_us();
@@ -2630,6 +2980,19 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 
   q->exec_us     = (stop_us - start_us) / stage_max;
   q->bitmap_size = count_bytes(trace_bits);
+  if(avg_us_fast == 0){
+    total_cal_us_fast += q->exec_us;
+    total_cal_cycles_fast += 1;
+    avg_us_fast = total_cal_us_fast / total_cal_cycles_fast;
+  }
+  else{
+      if (q->exec_us <= 4 * avg_us_fast){
+        total_cal_us_fast += q->exec_us;
+        total_cal_cycles_fast += 1;
+        avg_us_fast = total_cal_us_fast / total_cal_cycles_fast;
+      }
+  }
+  
   q->handicap    = handicap;
   q->cal_failed  = 0;
 
@@ -2673,6 +3036,195 @@ abort_calibration:
   return fault;
 
 }
+
+static u8 calibrate_case_dry_run(char** argv, struct queue_entry* q, u8* use_mem,
+                         u32 handicap, u8 from_queue) {
+
+  static u8 first_trace[MAP_SIZE];
+  static u8 cnt_free_trace[MAP_SIZE];
+
+  u8  fault = 0, new_bits = 0, var_detected = 0,
+      first_run = (q->exec_cksum == 0);
+
+  u64 start_us, stop_us;
+
+  s32 old_sc = stage_cur, old_sm = stage_max;
+  u32 use_tmout = exec_tmout;
+  u8* old_sn = stage_name;
+
+  /* Be a bit more generous about timeouts when resuming sessions, or when
+     trying to calibrate already-added finds. This helps avoid trouble due
+     to intermittent latency. */
+
+  if (!from_queue || resuming_fuzz)
+    use_tmout = MAX(exec_tmout + CAL_TMOUT_ADD,
+                    exec_tmout * CAL_TMOUT_PERC / 100);
+
+  q->cal_failed++;
+
+  stage_name = "calibration";
+  stage_max  = fast_cal ? 3 : CAL_CYCLES;
+
+  /* Make sure the forkserver is up before we do anything, and let's not
+     count its spin-up time toward binary calibration. */
+
+  if (dumb_mode != 1 && !no_forkserver && !forksrv_pid)
+    init_forkserver(argv);
+
+  if (q->cnt_free_cksum == 0){
+    memcpy(cnt_free_trace, trace_bits, MAP_SIZE);
+    simplify_trace((u64*)cnt_free_trace); 
+    q->cnt_free_cksum = hash32(cnt_free_trace, MAP_SIZE, HASH_CONST);
+    
+    /* check current seed's bitmap hash is dupliacted or not. */
+    u32 cur_cnt_free_cksum = q->cnt_free_cksum;
+    u8 found_dup = 0;
+    for (int cksum_idx = 0; cksum_idx < cnt_free_cksum_cnt; cksum_idx++) {
+      if(cur_cnt_free_cksum == cnt_free_cksum_cache[cksum_idx]){
+        /* mark duplicated cksum, skip this seed later */
+        q->cnt_free_cksum_dup = 1;
+        found_dup = 1;
+        break;
+      }
+    }
+    /* save unique cksum */
+    if (!found_dup){
+      cnt_free_cksum_cache[cnt_free_cksum_cnt] = cur_cnt_free_cksum;
+      cnt_free_cksum_cnt += 1;
+      q->cnt_free_cksum_dup = 0;
+    }
+  }
+
+  if (q->exec_cksum) memcpy(first_trace, trace_bits, MAP_SIZE);
+
+  start_us = get_cur_time_us();
+
+  for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
+
+    u32 cksum;
+
+    if (!first_run && !(stage_cur % stats_update_freq)) show_stats();
+
+    write_to_testcase(use_mem, q->len);
+
+    fault = run_target(argv, use_tmout);
+
+    /* stop_soon is set by the handler for Ctrl+C. When it's pressed,
+       we want to bail out quickly. */
+
+    if (stop_soon || fault != crash_mode) goto abort_calibration;
+
+    if (!dumb_mode && !stage_cur && !count_bytes(trace_bits)) {
+      fault = FAULT_NOINST;
+      goto abort_calibration;
+    }
+
+    cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+
+    if (q->exec_cksum != cksum) {
+
+      if (stage_cur == 0)
+        increment_hit_bits();
+      
+      u8 hnb = has_new_bits(virgin_bits);
+      if (hnb > new_bits) new_bits = hnb;
+
+      if (q->exec_cksum) {
+
+        u32 i;
+
+        for (i = 0; i < MAP_SIZE; i++) {
+
+          if (!var_bytes[i] && first_trace[i] != trace_bits[i]) {
+
+            var_bytes[i] = 1;
+            stage_max    = CAL_CYCLES_LONG;
+
+          }
+
+        }
+
+        var_detected = 1;
+
+      } else {
+
+        q->exec_cksum = cksum;
+        memcpy(first_trace, trace_bits, MAP_SIZE);
+
+      }
+
+    }
+
+  }
+
+  stop_us = get_cur_time_us();
+
+  total_cal_us     += stop_us - start_us;
+  total_cal_cycles += stage_max;
+
+  /* OK, let's collect some stats about the performance of this test case.
+     This is used for fuzzing air time calculations in calculate_score(). */
+
+  q->exec_us     = (stop_us - start_us) / stage_max;
+  
+  if(avg_us_fast == 0){
+    total_cal_us_fast += q->exec_us;
+    total_cal_cycles_fast += 1;
+    avg_us_fast = total_cal_us_fast / total_cal_cycles_fast;
+  }
+  else{
+      if (q->exec_us <= 4 * avg_us_fast){
+        total_cal_us_fast += q->exec_us;
+        total_cal_cycles_fast += 1;
+        avg_us_fast = total_cal_us_fast / total_cal_cycles_fast;
+      }
+  }
+  
+  q->bitmap_size = count_bytes(trace_bits);
+  q->handicap    = handicap;
+  q->cal_failed  = 0;
+
+  total_bitmap_size += q->bitmap_size;
+  total_bitmap_entries++;
+
+  update_bitmap_score(q);
+
+  /* If this case didn't result in new output from the instrumentation, tell
+     parent. This is a non-critical problem, but something to warn the user
+     about. */
+
+  if (!dumb_mode && first_run && !fault && !new_bits) fault = FAULT_NOBITS;
+
+abort_calibration:
+
+  if (new_bits == 2 && !q->has_new_cov) {
+    q->has_new_cov = 1;
+    queued_with_cov++;
+  }
+
+  /* Mark variable paths. */
+
+  if (var_detected) {
+
+    var_byte_count = count_bytes(var_bytes);
+
+    if (!q->var_behavior) {
+      mark_as_variable(q);
+      queued_variable++;
+    }
+
+  }
+
+  stage_name = old_sn;
+  stage_cur  = old_sc;
+  stage_max  = old_sm;
+
+  if (!first_run) show_stats();
+
+  return fault;
+
+}
+
 
 
 /* Examine map coverage. Called once, for first test case. */
@@ -2720,7 +3272,7 @@ static void perform_dry_run(char** argv) {
 
     close(fd);
 
-    res = calibrate_case(argv, q, use_mem, 0, 1);
+    res = calibrate_case_dry_run(argv, q, use_mem, 0, 1);
     ck_free(use_mem);
 
     if (stop_soon) return;
@@ -3122,6 +3674,8 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
   u8  keeping = 0, res;
 
   if (fault == crash_mode) {
+      /* increment hit bits*/
+    increment_hit_bits();
 
     /* Keep only if there are new bits in the map, add to queue for
        future fuzzing, etc. */
@@ -3188,6 +3742,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 #else
         simplify_trace((u32*)trace_bits);
 #endif /* ^__x86_64__ */
+        increment_hit_bits();
 
         if (!has_new_bits(virgin_tmout)) return keeping;
 
@@ -3252,6 +3807,7 @@ keep_as_crash:
 #else
         simplify_trace((u32*)trace_bits);
 #endif /* ^__x86_64__ */
+        increment_hit_bits();
 
         if (!has_new_bits(virgin_crash)) return keeping;
 
@@ -4093,9 +4649,8 @@ static void show_stats(void) {
      together, but then cram them into a fixed-width field - so we need to
      put them in a temporary buffer first. */
 
-  sprintf(tmp, "%s%s (%0.02f%%)", DI(current_entry),
-          queue_cur->favored ? "" : "*",
-          ((double)current_entry * 100) / queued_paths);
+  sprintf(tmp, "%s (%0.02f%%)", DI(queue_cur->qid),
+          ((double)queue_cur->qid * 100) / queued_paths);
 
   SAYF(bV bSTOP "  now processing : " cRST "%-17s " bSTG bV bSTOP, tmp);
 
@@ -4336,114 +4891,6 @@ static void show_stats(void) {
 }
 
 
-/* Display quick statistics at the end of processing the input directory,
-   plus a bunch of warnings. Some calibration stuff also ended up here,
-   along with several hardcoded constants. Maybe clean up eventually. */
-
-static void show_init_stats(void) {
-
-  struct queue_entry* q = queue;
-  u32 min_bits = 0, max_bits = 0;
-  u64 min_us = 0, max_us = 0;
-  u64 avg_us = 0;
-  u32 max_len = 0;
-
-  if (total_cal_cycles) avg_us = total_cal_us / total_cal_cycles;
-
-  while (q) {
-
-    if (!min_us || q->exec_us < min_us) min_us = q->exec_us;
-    if (q->exec_us > max_us) max_us = q->exec_us;
-
-    if (!min_bits || q->bitmap_size < min_bits) min_bits = q->bitmap_size;
-    if (q->bitmap_size > max_bits) max_bits = q->bitmap_size;
-
-    if (q->len > max_len) max_len = q->len;
-
-    q = q->next;
-
-  }
-
-  SAYF("\n");
-
-  if (avg_us > (qemu_mode ? 50000 : 10000)) 
-    WARNF(cLRD "The target binary is pretty slow! See %s/perf_tips.txt.",
-          doc_path);
-
-  /* Let's keep things moving with slow binaries. */
-
-  if (avg_us > 50000) havoc_div = 10;     /* 0-19 execs/sec   */
-  else if (avg_us > 20000) havoc_div = 5; /* 20-49 execs/sec  */
-  else if (avg_us > 10000) havoc_div = 2; /* 50-100 execs/sec */
-
-  if (!resuming_fuzz) {
-
-    if (max_len > 50 * 1024)
-      WARNF(cLRD "Some test cases are huge (%s) - see %s/perf_tips.txt!",
-            DMS(max_len), doc_path);
-    else if (max_len > 10 * 1024)
-      WARNF("Some test cases are big (%s) - see %s/perf_tips.txt.",
-            DMS(max_len), doc_path);
-
-    if (useless_at_start && !in_bitmap)
-      WARNF(cLRD "Some test cases look useless. Consider using a smaller set.");
-
-    if (queued_paths > 100)
-      WARNF(cLRD "You probably have far too many input files! Consider trimming down.");
-    else if (queued_paths > 20)
-      WARNF("You have lots of input files; try starting small.");
-
-  }
-
-  OKF("Here are some useful stats:\n\n"
-
-      cGRA "    Test case count : " cRST "%u favored, %u variable, %u total\n"
-      cGRA "       Bitmap range : " cRST "%u to %u bits (average: %0.02f bits)\n"
-      cGRA "        Exec timing : " cRST "%s to %s us (average: %s us)\n",
-      queued_favored, queued_variable, queued_paths, min_bits, max_bits, 
-      ((double)total_bitmap_size) / (total_bitmap_entries ? total_bitmap_entries : 1),
-      DI(min_us), DI(max_us), DI(avg_us));
-
-  if (!timeout_given) {
-
-    /* Figure out the appropriate timeout. The basic idea is: 5x average or
-       1x max, rounded up to EXEC_TM_ROUND ms and capped at 1 second.
-
-       If the program is slow, the multiplier is lowered to 2x or 3x, because
-       random scheduler jitter is less likely to have any impact, and because
-       our patience is wearing thin =) */
-
-    if (avg_us > 50000) exec_tmout = avg_us * 2 / 1000;
-    else if (avg_us > 10000) exec_tmout = avg_us * 3 / 1000;
-    else exec_tmout = avg_us * 5 / 1000;
-
-    exec_tmout = MAX(exec_tmout, max_us / 1000);
-    exec_tmout = (exec_tmout + EXEC_TM_ROUND) / EXEC_TM_ROUND * EXEC_TM_ROUND;
-
-    if (exec_tmout > EXEC_TIMEOUT) exec_tmout = EXEC_TIMEOUT;
-
-    ACTF("No -t option specified, so I'll use exec timeout of %u ms.", 
-         exec_tmout);
-
-    timeout_given = 1;
-
-  } else if (timeout_given == 3) {
-
-    ACTF("Applying timeout settings from resumed session (%u ms).", exec_tmout);
-
-  }
-
-  /* In dumb mode, re-running every timing out test case with a generous time
-     limit is very expensive, so let's select a more conservative default. */
-
-  if (dumb_mode && !getenv("AFL_HANG_TMOUT"))
-    hang_tmout = MIN(EXEC_TIMEOUT, exec_tmout * 2 + 100);
-
-  OKF("All set and ready to roll!");
-
-}
-
-
 /* Find first power of two greater or equal to val (assuming val under
    2^31). */
 
@@ -4568,7 +5015,7 @@ static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
     close(fd);
 
     memcpy(trace_bits, clean_trace, MAP_SIZE);
-    update_bitmap_score(q);
+    // update_bitmap_score(q);
 
   }
 
@@ -4580,13 +5027,11 @@ abort_trimming:
 }
 
 
-/* Write a modified test case, run program, process results. Handle
-   error conditions, returning 1 if it's time to bail out. This is
-   a helper function for fuzz_one(). */
 
-EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
+EXP_ST u8 common_fuzz_stuff_splice(char** argv, u8* out_buf, u32 len) {
 
   u8 fault;
+  u64 start_us, end_us;
 
   if (post_handler) {
 
@@ -4594,10 +5039,17 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
     if (!out_buf || !len) return 0;
 
   }
+  start_us = get_cur_time_us();
 
   write_to_testcase(out_buf, len);
 
   fault = run_target(argv, exec_tmout);
+
+  end_us = get_cur_time_us();
+
+  double exec_num = ((double)1000000.0)/(end_us-start_us);
+
+  if (exec_num <= 10) return 2;
 
   if (stop_soon) return 1;
 
@@ -4620,6 +5072,38 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
      return 1;
 
   }
+
+  /* This handles FAULT_ERROR for us: */
+
+  queued_discovered += save_if_interesting(argv, out_buf, len, fault);
+
+  if (!(stage_cur % stats_update_freq) || stage_cur + 1 == stage_max)
+    show_stats();
+
+  return 0;
+
+}
+/* Write a modified test case, run program, process results. Handle
+   error conditions, returning 1 if it's time to bail out. This is
+   a helper function for fuzz_one(). */
+
+EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
+
+  u8 fault;
+
+  if (post_handler) {
+
+    out_buf = post_handler(out_buf, &len);
+    if (!out_buf || !len) return 0;
+
+  }
+
+  write_to_testcase(out_buf, len);
+
+  fault = run_target(argv, exec_tmout);
+
+  if (stop_soon) return 1;
+
 
   /* This handles FAULT_ERROR for us: */
 
@@ -4675,74 +5159,75 @@ static u32 choose_block_len(u32 limit) {
 
 }
 
+// compute weight using top border edges
+static double check_top_border_edge(struct queue_entry* q) {
+
+  int nonzero_border_edge_cnt = 0;
+  int nonzero_border_edge_thres_cnt = 0;
+  double thres_energy = 0.0;
+  
+  int new_border_edge = 0;
+  for (int i = 0; i < q->border_edge_cnt; i++){
+    int border_edge_idx = q->border_edge[i];
+    int child = border_edge_child[border_edge_idx];
+    // check border edge is still not triggered
+    if (virgin_bits[child] == 0xff){
+      double tmp_edge_weight =  border_edge_weight[border_edge_idx];
+      // add nonzero border edge weight
+      if (fpclassify(tmp_edge_weight) != FP_ZERO){
+        nonzero_border_edge_cnt += 1;
+        if (isgreaterequal(tmp_edge_weight, border_edge_weight_threshold)){
+          nonzero_border_edge_thres_cnt += 1;
+          thres_energy += tmp_edge_weight;
+        }
+      }
+      // check if zero borde edge weight is new, or just zero weight
+      else{
+        int parent = border_edge_parent[border_edge_idx];
+        // new border edge
+        if ((fpclassify(katz_weight[child]) != FP_ZERO) && (virgin_bits[child] == 0xff) && (hit_bits[parent] > 0)){
+          
+          tmp_edge_weight = katz_weight[child] / sqrt(hit_bits[parent]); 
+          border_edge_weight[border_edge_idx] = tmp_edge_weight;
+          
+          nonzero_border_edge_cnt += 1;
+          thres_energy += tmp_edge_weight;
+          new_border_edge += 1;        
+        }
+      }
+    }
+  }
+  nonzero_border_edge_thres_cnt += new_border_edge;
+  
+  
+  if((nonzero_border_edge_cnt == 0) || (nonzero_border_edge_thres_cnt == 0)){
+    thres_energy = 1/scale_factor;
+  }
+  
+  fprintf(sched_log_file, "%d, %f, %d, %d, %d", queue_cur->qid, thres_energy * scale_factor, nonzero_border_edge_cnt, nonzero_border_edge_thres_cnt, new_border_edge);
+
+  return thres_energy;
+
+}
 
 /* Calculate case desirability score to adjust the length of havoc fuzzing.
    A helper function for fuzz_one(). Maybe some of these constants should
    go into config.h. */
 
-static u32 calculate_score(struct queue_entry* q) {
+static double calculate_score(struct queue_entry* q, double thres_energy, u32 perf_score) {
 
-  u32 avg_exec_us = total_cal_us / total_cal_cycles;
-  u32 avg_bitmap_size = total_bitmap_size / total_bitmap_entries;
-  u32 perf_score = 100;
-
+  double energy = 0.0;
   /* Adjust score based on execution speed of this path, compared to the
      global average. Multiplier ranges from 0.1x to 3x. Fast inputs are
      less expensive to fuzz, so we're giving them more air time. */
 
-  if (q->exec_us * 0.1 > avg_exec_us) perf_score = 10;
-  else if (q->exec_us * 0.25 > avg_exec_us) perf_score = 25;
-  else if (q->exec_us * 0.5 > avg_exec_us) perf_score = 50;
-  else if (q->exec_us * 0.75 > avg_exec_us) perf_score = 75;
-  else if (q->exec_us * 4 < avg_exec_us) perf_score = 300;
-  else if (q->exec_us * 3 < avg_exec_us) perf_score = 200;
-  else if (q->exec_us * 2 < avg_exec_us) perf_score = 150;
+  energy = perf_score *  thres_energy * scale_factor;
 
-  /* Adjust score based on bitmap size. The working theory is that better
-     coverage translates to better targets. Multiplier from 0.25x to 3x. */
+  fprintf(sched_log_file, " %d %f || ", perf_score, energy);
 
-  if (q->bitmap_size * 0.3 > avg_bitmap_size) perf_score *= 3;
-  else if (q->bitmap_size * 0.5 > avg_bitmap_size) perf_score *= 2;
-  else if (q->bitmap_size * 0.75 > avg_bitmap_size) perf_score *= 1.5;
-  else if (q->bitmap_size * 3 < avg_bitmap_size) perf_score *= 0.25;
-  else if (q->bitmap_size * 2 < avg_bitmap_size) perf_score *= 0.5;
-  else if (q->bitmap_size * 1.5 < avg_bitmap_size) perf_score *= 0.75;
+  if (energy > HAVOC_MAX_MULT * 100) energy = HAVOC_MAX_MULT * 100;
 
-  /* Adjust score based on handicap. Handicap is proportional to how late
-     in the game we learned about this path. Latecomers are allowed to run
-     for a bit longer until they catch up with the rest. */
-
-  if (q->handicap >= 4) {
-
-    perf_score *= 4;
-    q->handicap -= 4;
-
-  } else if (q->handicap) {
-
-    perf_score *= 2;
-    q->handicap--;
-
-  }
-
-  /* Final adjustment based on input depth, under the assumption that fuzzing
-     deeper test cases is more likely to reveal stuff that can't be
-     discovered with traditional fuzzers. */
-
-  switch (q->depth) {
-
-    case 0 ... 3:   break;
-    case 4 ... 7:   perf_score *= 2; break;
-    case 8 ... 13:  perf_score *= 3; break;
-    case 14 ... 25: perf_score *= 4; break;
-    default:        perf_score *= 5;
-
-  }
-
-  /* Make sure that we don't go over limit. */
-
-  if (perf_score > HAVOC_MAX_MULT * 100) perf_score = HAVOC_MAX_MULT * 100;
-
-  return perf_score;
+  return energy;
 
 }
 
@@ -4942,50 +5427,37 @@ static u8 fuzz_one(char** argv) {
   s32 len, fd, temp_len, i, j;
   u8  *in_buf, *out_buf, *orig_in, *ex_tmp, *eff_map = 0;
   u64 havoc_queued,  orig_hit_cnt, new_hit_cnt;
-  u32 splice_cycle = 0, perf_score = 100, orig_perf, prev_cksum, eff_cnt = 1;
-
+  u32 splice_cycle = 0,  prev_cksum, eff_cnt = 1;
+  double perf_score = 100;
+  double orig_perf;
   u8  ret_val = 1, doing_det = 0;
 
   u8  a_collect[MAX_AUTO_EXTRA];
   u32 a_len = 0;
-
-#ifdef IGNORE_FINDS
-
-  /* In IGNORE_FINDS mode, skip any entries that weren't in the
-     initial data set. */
-
-  if (queue_cur->depth > 1) return 1;
-
-#else
-
-  if (pending_favored) {
-
-    /* If we have any favored, non-fuzzed new arrivals in the queue,
-       possibly skip to them at the expense of already-fuzzed or non-favored
-       cases. */
-
-    if ((queue_cur->was_fuzzed || !queue_cur->favored) &&
-        UR(100) < SKIP_TO_NEW_PROB) return 1;
-
-  } else if (!dumb_mode && !queue_cur->favored && queued_paths > 10) {
-
-    /* Otherwise, still possibly skip non-favored cases, albeit less often.
-       The odds of skipping stuff are higher for already-fuzzed inputs and
-       lower for never-fuzzed entries. */
-
-    if (queue_cycle > 1 && !queue_cur->was_fuzzed) {
-
-      if (UR(100) < SKIP_NFAV_NEW_PROB) return 1;
-
-    } else {
-
-      if (UR(100) < SKIP_NFAV_OLD_PROB) return 1;
-
-    }
-
+  
+  // Early reject a seed if didn't hit any top border edge
+  double thres_energy = check_top_border_edge(queue_cur);
+  if (fpclassify(thres_energy) == FP_ZERO){
+    if (!queue_cur->was_fuzzed) 
+      queue_cur->was_fuzzed = 1;
+    return 1;
+  }
+   
+  // Early reject a seed whose execution trace(i.e., bitmap) is duplicated with other seeds.
+  if (queue_cur->cnt_free_cksum_dup == 1){
+    if (!queue_cur->was_fuzzed) 
+      queue_cur->was_fuzzed = 1;
+    fprintf(sched_log_file, " duplicated \n");
+    return 1;
+  }
+  if (queue_cur->cnt_free_cksum == last_cnt_free_cksum){
+    if (!queue_cur->was_fuzzed) 
+      queue_cur->was_fuzzed = 1;
+    fprintf(sched_log_file, " duplicated \n");
+    return 1;
   }
 
-#endif /* ^IGNORE_FINDS */
+  last_cnt_free_cksum  = queue_cur->cnt_free_cksum;
 
   if (not_on_tty) {
     ACTF("Fuzzing test case #%u (%u total, %llu uniq crashes found)...",
@@ -5041,6 +5513,23 @@ static u8 fuzz_one(char** argv) {
 
   }
 
+  u32 init_perf_score = 100;
+  struct queue_entry* q = queue_cur; 
+  if (q->exec_us * 0.05 > avg_us_fast) init_perf_score = 0;
+  else if (q->exec_us * 0.075 > avg_us_fast) init_perf_score = 1;
+  else if (q->exec_us * 0.1 > avg_us_fast) init_perf_score = 10;
+  else if (q->exec_us * 0.25 > avg_us_fast) init_perf_score = 25;
+  else if (q->exec_us * 0.5 > avg_us_fast) init_perf_score = 50;
+  else if (q->exec_us * 0.75 > avg_us_fast) init_perf_score = 75;
+  else if (q->exec_us * 4 < avg_us_fast) init_perf_score = 300;
+  else if (q->exec_us * 3 < avg_us_fast) init_perf_score = 200;
+  else if (q->exec_us * 2 < avg_us_fast) init_perf_score = 150;
+  
+  if(init_perf_score <= 75) queue_cur->trim_done = 1;
+  
+  if(init_perf_score == 0) goto abandon_entry;
+
+
   /************
    * TRIMMING *
    ************/
@@ -5070,14 +5559,15 @@ static u8 fuzz_one(char** argv) {
   /*********************
    * PERFORMANCE SCORE *
    *********************/
-
-  orig_perf = perf_score = calculate_score(queue_cur);
+  //TODO: slow input should not go into determinisitc phase
+  orig_perf = perf_score = calculate_score(queue_cur, thres_energy, init_perf_score);
+  if (fpclassify(perf_score) == FP_ZERO) goto abandon_entry;
 
   /* Skip right away if -d is given, if we have done deterministic fuzzing on
      this entry ourselves (was_fuzzed), or if it has gone through deterministic
      testing in earlier, resumed runs (passed_det). */
 
-  if (skip_deterministic || queue_cur->was_fuzzed || queue_cur->passed_det)
+  if (skip_deterministic || queue_cur->was_fuzzed || queue_cur->passed_det || init_perf_score <= 25)
     goto havoc_stage;
 
   /* Skip deterministic fuzzing if exec path checksum puts this out of scope
@@ -6058,9 +6548,13 @@ havoc_stage:
 
     stage_name  = "havoc";
     stage_short = "havoc";
-    stage_max   = (doing_det ? HAVOC_CYCLES_INIT : HAVOC_CYCLES) *
+    stage_max   = (int) (doing_det ? HAVOC_CYCLES_INIT : HAVOC_CYCLES) *
                   perf_score / havoc_div / 100;
 
+    if (stage_max < 2*HAVOC_MIN) stage_max = 2*HAVOC_MIN;
+
+    fprintf(sched_log_file, " %d\n", stage_max);
+    fflush(sched_log_file);
   } else {
 
     static u8 tmp[32];
@@ -6071,6 +6565,10 @@ havoc_stage:
     stage_name  = tmp;
     stage_short = "splice";
     stage_max   = SPLICE_HAVOC * perf_score / havoc_div / 100;
+    
+    // if the spliced source input is super slow, then skip current splice stage.
+    if (common_fuzz_stuff_splice(argv, out_buf, len) == 2)
+      goto retry_splicing;
 
   }
 
@@ -6480,7 +6978,7 @@ havoc_stage:
 
     if (queued_paths != havoc_queued) {
 
-      if (perf_score <= HAVOC_MAX_MULT * 100) {
+      if ((perf_score <= HAVOC_MAX_MULT * 100) && (init_perf_score >=100)){
         stage_max  *= 2;
         perf_score *= 2;
       }
@@ -6515,7 +7013,7 @@ havoc_stage:
 retry_splicing:
 
   if (use_splicing && splice_cycle++ < SPLICE_CYCLES &&
-      queued_paths > 1 && queue_cur->len > 1) {
+      queued_paths > 1 && queue_cur->len > 1 && init_perf_score >= 25) {
 
     struct queue_entry* target;
     u32 tid, split_at;
@@ -7197,6 +7695,31 @@ EXP_ST void setup_dirs_fds(void) {
                      "unique_hangs, max_depth, execs_per_sec\n");
                      /* ignore errors */
 
+  tmp = alloc_printf("%s/edge_weight", out_dir);
+  fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
+  if (fd < 0) PFATAL("Unable to create '%s'", tmp);
+  ck_free(tmp);
+
+  edge_weight_file = fdopen(fd, "w");
+  if (!edge_weight_file) PFATAL("fdopen() failed");
+
+  
+  tmp = alloc_printf("%s/scheudle_log", out_dir);
+  fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
+  if (fd < 0) PFATAL("Unable to create '%s'", tmp);
+  ck_free(tmp);
+
+  sched_log_file = fdopen(fd, "w");
+  if (!sched_log_file) PFATAL("fdopen() failed");
+
+
+  tmp = alloc_printf("%s/edge_log", out_dir);
+  fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
+  if (fd < 0) PFATAL("Unable to create '%s'", tmp);
+  ck_free(tmp);
+
+  edge_log_file = fdopen(fd, "w");
+  if (!edge_log_file) PFATAL("fdopen() failed");
 }
 
 
@@ -7698,6 +8221,103 @@ static void save_cmdline(u32 argc, char** argv) {
 
 }
 
+void load_centrality_file(){
+  FILE * fp;
+  char *line = NULL;
+  size_t len = 0;
+  ssize_t read;
+   
+  // create signal file, write 0 for initialization
+  fp = fopen("signal", "w");
+  if(fp == NULL){
+    perror("signal open failed \n");
+    exit(0);
+  }
+  char *buf = "0\n";
+  fwrite(buf, 2, 1, fp);
+  fclose(fp);
+  
+
+  // read katz centrality 
+  fp = fopen("katz_cent", "r");
+  if(fp == NULL){
+    perror("katz_cent open failed \n");
+    exit(0);
+  }
+  int line_cnt = 0;
+  while((read = getline(&line, &len, fp)) != -1){
+    char* idx_ptr = strtok(line, " ");    
+    int idx = atoi(idx_ptr);
+    char* cent_ptr = strtok(NULL, " ");
+    char* end_ptr;
+    double ret = strtod(cent_ptr, &end_ptr);
+    katz_weight[idx] = ret;
+    line_cnt += 1;
+  }
+  free(line);
+  fclose(fp);
+  num_edge = line_cnt + 1;
+  
+  // read border edge pair
+  fp = fopen("border_edges", "r");
+  if(fp == NULL){
+    perror("border_edges open failed \n");
+    exit(0);
+  }
+  
+  line = NULL;
+  line_cnt = 0;
+  while((read = getline(&line, &len, fp)) != -1){
+    char* parent_ptr = strtok(line, " ");    
+    int parent = atoi(parent_ptr);
+    char* child_ptr = strtok(NULL, " ");
+    int child = atoi(child_ptr);
+    border_edge_parent[line_cnt] = parent;
+    border_edge_child[line_cnt] = child;
+    line_cnt += 1;
+  }
+  free(line);
+  fclose(fp);
+  num_border_edge = line_cnt;
+
+  // read child_list for each node
+  fp = fopen("child_node", "r");
+  if(fp == NULL){
+    perror("child_node open failed \n");
+    exit(0);
+  }
+  
+  line = NULL;
+  while((read = getline(&line, &len, fp)) != -1){
+    
+    int children_cnt = 0;
+    for(int i=0; i<strlen(line); i++)
+      if(line[i] == ' ')
+        children_cnt += 1;
+    
+    char* node_ptr = strtok(line, " ");    
+    // allocate memory for child_list
+    int node = atoi(node_ptr);
+    node_child_list[node] = (child_list *) ck_alloc(sizeof(child_list));
+    //memset(node_child_list[node], 0 , sizeof(child_list));
+    node_child_list[node]->total = children_cnt;
+    if(children_cnt == 0)
+      node_child_list[node]->children = NULL;
+    else{
+      node_child_list[node]->children =(int *) ck_alloc(sizeof(int) * children_cnt);
+      //memset(node_child_list[node]->children, 0 , sizeof(int) * children_cnt);
+    }
+    // write children list 
+    for(int i=0; i<children_cnt; i++){
+      char* child_ptr = strtok(NULL, " ");
+      node_child_list[node]->children[i] = atoi(child_ptr);
+    }
+  }
+  free(line);
+  fclose(fp);
+  
+  //initlize   
+}
 
 #ifndef AFL_LIB
 
@@ -7723,7 +8343,7 @@ int main(int argc, char** argv) {
   gettimeofday(&tv, &tz);
   srandom(tv.tv_sec ^ tv.tv_usec ^ getpid());
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:Q")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:p:j:t:T:dknCB:S:M:x:Q")) > 0)
 
     switch (opt) {
 
@@ -7837,6 +8457,14 @@ int main(int argc, char** argv) {
 
         break;
 
+      case 'p': 
+        sscanf(optarg,"%d",&pass_rate);            
+        break;
+     
+      case 'j':
+        sscanf(optarg,"%d",&adjust_rate);
+        break;
+
       case 'd': /* skip deterministic */
 
         if (skip_deterministic) FATAL("Multiple -d options not supported");
@@ -7899,6 +8527,7 @@ int main(int argc, char** argv) {
 
   if (optind == argc || !in_dir || !out_dir) usage(argv[0]);
 
+  load_centrality_file();
   setup_signal_handlers();
   check_asan_opts();
 
@@ -7944,9 +8573,7 @@ int main(int argc, char** argv) {
 
   get_core_count();
 
-#ifdef HAVE_AFFINITY
   bind_to_free_cpu();
-#endif /* HAVE_AFFINITY */
 
   check_crash_handling();
   check_cpu_governor();
@@ -7980,10 +8607,6 @@ int main(int argc, char** argv) {
 
   perform_dry_run(use_argv);
 
-  cull_queue();
-
-  show_init_stats();
-
   seek_to = find_start_position();
 
   write_stats_file(0, 0, 0);
@@ -8003,7 +8626,8 @@ int main(int argc, char** argv) {
 
     u8 skipped_fuzz;
 
-    cull_queue();
+    if (! queue_cur_expor)
+      queue_cur_expor = queue;
 
     if (!queue_cur) {
 
@@ -8040,6 +8664,9 @@ int main(int argc, char** argv) {
         sync_fuzzers(use_argv);
 
     }
+    
+    cull_queue();
+    
 
     skipped_fuzz = fuzz_one(use_argv);
 
@@ -8053,6 +8680,10 @@ int main(int argc, char** argv) {
     if (!stop_soon && exit_1) stop_soon = 2;
 
     if (stop_soon) break;
+
+    /* in exploration mode, update queue_cur_exp */
+    if (schedule_explor == 1)
+      queue_cur_expor = queue_cur_expor->next;
 
     queue_cur = queue_cur->next;
     current_entry++;
@@ -8081,6 +8712,9 @@ stop_fuzzing:
   }
 
   fclose(plot_file);
+  fclose(edge_weight_file);
+  fclose(sched_log_file);
+  fclose(edge_log_file);
   destroy_queue();
   destroy_extras();
   ck_free(target_path);

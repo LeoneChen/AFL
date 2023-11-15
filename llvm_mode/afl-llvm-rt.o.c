@@ -292,6 +292,7 @@ void __sanitizer_cov_trace_pc_guard_init(uint32_t* start, uint32_t* stop) {
      to avoid duplicate calls (which can happen as an artifact of the underlying
      implementation in LLVM). */
 
+/* 
   *(start++) = R(MAP_SIZE - 1) + 1;
 
   while (start < stop) {
@@ -302,5 +303,9 @@ void __sanitizer_cov_trace_pc_guard_init(uint32_t* start, uint32_t* stop) {
     start++;
 
   }
+ */
 
+  static int N = 0;
+  for (uint32_t *ptr = start; ptr < stop; ptr++)
+    *ptr = ++N;  // Guards should start from 1.
 }
